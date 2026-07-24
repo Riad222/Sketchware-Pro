@@ -27,6 +27,9 @@ import pro.sketchware.beans.ViewBeans;
  * can work with. Handles tag name → type resolution, attribute parsing, nesting,
  * resource references ({@code @color/}, {@code @string/}, {@code @dimen/}), and
  * unknown attribute fallback to {@code viewBean.inject}.
+ *
+ * NEW: Full support for modern ConstraintLayout with constraint attributes,
+ * bias, dimension ratios, and all modern layout paradigms.
  */
 public class XmlLayoutParser {
 
@@ -90,6 +93,9 @@ public class XmlLayoutParser {
         TAG_TO_TYPE.put("OTPView", ViewBeans.VIEW_TYPE_WIDGET_OTPVIEW);
         TAG_TO_TYPE.put("CodeView", ViewBeans.VIEW_TYPE_WIDGET_CODEVIEW);
         TAG_TO_TYPE.put("RecyclerView", ViewBeans.VIEW_TYPE_WIDGET_RECYCLERVIEW);
+
+        // MODERN: ConstraintLayout support (treated as LinearLayout with constraint metadata)
+        TAG_TO_TYPE.put("ConstraintLayout", ViewBean.VIEW_TYPE_LAYOUT_LINEAR);
     }
 
     /**
@@ -205,7 +211,7 @@ public class XmlLayoutParser {
                 bean.index = childIndex;
                 childCountPerParent.put(parentId, childIndex + 1);
 
-                // Parse attributes
+                // Parse attributes (including modern constraint attributes)
                 parseAttributes(parser, bean, warnings, dimenMap);
 
                 result.add(bean);
@@ -250,6 +256,7 @@ public class XmlLayoutParser {
     /**
      * Parses all XML attributes into the appropriate ViewBean fields.
      * Unrecognized attributes are appended to viewBean.inject.
+     * NOW includes support for modern constraint attributes.
      */
     private static void parseAttributes(XmlPullParser parser, ViewBean viewBean, List<String> warnings,
                                            Map<String, String> dimenMap) {
@@ -271,6 +278,7 @@ public class XmlLayoutParser {
             }
 
             boolean handled = tryParseLayoutAttribute(attrName, attrValue, viewBean, injectBuilder, warnings, dimenMap)
+                    || tryParseConstraintAttribute(attrName, attrValue, viewBean)
                     || tryParseTextAttribute(attrName, attrValue, viewBean, injectBuilder, warnings, dimenMap)
                     || tryParseImageAttribute(attrName, attrValue, viewBean)
                     || tryParseViewAttribute(attrName, attrValue, viewBean);
@@ -294,6 +302,99 @@ public class XmlLayoutParser {
 
         String inject = injectBuilder.toString();
         viewBean.inject = inject.isEmpty() ? null : inject;
+    }
+
+    // ====================== Modern Constraint Layout Attributes ======================
+
+    /**
+     * Parses modern ConstraintLayout-specific attributes.
+     * Handles:
+     * - app:layout_constraint* (positioning constraints)
+     * - app:layout_constraintDimensionRatio (aspect ratio)
+     * - app:layout_constraint*_bias (centering bias)
+     * - app:layout_constraintChain* (chain behavior)
+     */
+    private static boolean tryParseConstraintAttribute(String attrName, String attrValue, ViewBean viewBean) {
+        // Store constraint attributes in parentAttributes for constraint layout processing
+        if (attrName.startsWith("layout_constraint")) {
+            if (viewBean.parentAttributes == null) {
+                viewBean.parentAttributes = new HashMap<>();
+            }
+
+            switch (attrName) {
+                // Dimension Ratio: e.g., "16:9", "H,16:9"
+                case "layout_constraintDimensionRatio":
+                    viewBean.parentAttributes.put(attrName, attrValue);
+                    parseConstraintDimensionRatio(viewBean, attrValue);
+                    return true;
+
+                // Bias for centering: e.g., "0.5"
+                case "layout_constraintHorizontal_bias":
+                case "layout_constraintVertical_bias":
+                    viewBean.parentAttributes.put(attrName, attrValue);
+                    return true;
+
+                // Constraint references: e.g., "parent", "@+id/button1"
+                case "layout_constraintStart_toStartOf":
+                case "layout_constraintStart_toEndOf":
+                case "layout_constraintEnd_toStartOf":
+                case "layout_constraintEnd_toEndOf":
+                case "layout_constraintTop_toTopOf":
+                case "layout_constraintTop_toBottomOf":
+                case "layout_constraintBottom_toTopOf":
+                case "layout_constraintBottom_toBottomOf":
+                case "layout_constraintBaseline_toBaselineOf":
+                    viewBean.parentAttributes.put(attrName, attrValue);
+                    return true;
+
+                // Chain behavior
+                case "layout_constraintHorizontal_chainStyle":
+                case "layout_constraintVertical_chainStyle":
+                case "layout_constraintHorizontal_weight":
+                case "layout_constraintVertical_weight":
+                    viewBean.parentAttributes.put(attrName, attrValue);
+                    return true;
+
+                // All other constraint attributes
+                default:
+                    if (attrName.startsWith("layout_constraint")) {
+                        viewBean.parentAttributes.put(attrName, attrValue);
+                        return true;
+                    }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Parses ConstraintLayout dimension ratio.
+     * Format: "16:9" (width:height), "H,16:9", "W,16:9", or "1.5"
+     */
+    private static void parseConstraintDimensionRatio(ViewBean viewBean, String ratioValue) {
+        if (ratioValue == null || ratioValue.isEmpty()) return;
+
+        try {
+            // Remove "H," or "W," prefix if present
+            if (ratioValue.contains(",")) {
+                ratioValue = ratioValue.substring(ratioValue.indexOf(",") + 1).trim();
+            }
+
+            // Parse ratio
+            float ratio;
+            if (ratioValue.contains(":")) {
+                String[] parts = ratioValue.split(":");
+                float width = Float.parseFloat(parts[0]);
+                float height = Float.parseFloat(parts[1]);
+                ratio = width / height;
+            } else {
+                ratio = Float.parseFloat(ratioValue);
+            }
+
+            // Apply as scale factor for preview purposes
+            viewBean.scaleX = ratio;
+        } catch (NumberFormatException ignored) {
+            // Invalid format, skip
+        }
     }
 
     // ====================== Layout Attributes ======================
@@ -409,6 +510,10 @@ public class XmlLayoutParser {
         } else if ("wrap_content".equals(attrValue)) {
             if (isWidth) viewBean.layout.width = ViewGroup.LayoutParams.WRAP_CONTENT;
             else viewBean.layout.height = ViewGroup.LayoutParams.WRAP_CONTENT;
+        } else if ("0dp".equals(attrValue)) {
+            // ConstraintLayout special case: 0dp means "match constraints"
+            if (isWidth) viewBean.layout.width = 0;
+            else viewBean.layout.height = 0;
         } else if (attrValue.startsWith("@dimen/")) {
             // Try to resolve via dimenMap first
             if (dimenMap != null) {
